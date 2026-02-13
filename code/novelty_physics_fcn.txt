@@ -1,0 +1,47 @@
+Physics + data-driven novelty in grid_FD_multi_channel_one_FCN_RUL_physics.py
+==========================================================================
+
+1) Physics-informed loss with masked monotonicity and slope prior
+-----------------------------------------------------------------
+- Base term: mean squared error (MSE) between predicted RUL \hat{y} and true RUL y:
+  L_mse = (1/N) * sum_i (y_i - \hat{y}_i)^2
+- Per-sample consecutive deltas: \Delta y_i = y_i - y_{i-1}, \Delta \hat{y}_i = \hat{y}_i - \hat{y}_{i-1}
+- Mask to keep only within-engine steps (true deltas < 0): m_i = 1 if \Delta y_i < 0 else 0
+- Monotonic penalty (discourages upward RUL jumps inside an engine):
+  L_mono = (1 / sum_i m_i) * sum_i m_i * ReLU(\Delta \hat{y}_i)
+- Linear decay prior (track predicted slope to observed slope):
+  L_slope = (1 / sum_i m_i) * sum_i m_i * (\Delta \hat{y}_i - \Delta y_i)^2
+- Optional curvature smoothing on predicted slopes (off by default):
+  L_smooth = mean_i (\Delta \hat{y}_i - \Delta \hat{y}_{i-1})^2
+- Total physics-informed loss:
+  L_total = L_mse + alpha * L_mono + gamma * L_slope + beta * L_smooth
+  with alpha = 0.1, gamma = 0.05, beta = 0.0 (can be enabled).
+- Novelty: masking uses true-label deltas to avoid penalizing cross-engine boundaries, so physics constraints apply only inside engines.
+
+2) Physics diagnostics at evaluation time
+----------------------------------------
+- Monotonic violation mean: \bar{v} = (1 / sum_i m_i) * sum_i m_i * max(\Delta \hat{y}_i, 0)
+- Slope RMSE: RMSE_slope = sqrt( (1 / sum_i m_i) * sum_i m_i * (\Delta \hat{y}_i - \Delta y_i)^2 )
+- These are logged alongside RMSE and UPE, quantifying physics consistency (fewer upward jumps, closer slope).
+
+3) Asymmetric operational penalty (UPE)
+---------------------------------------
+- UPE punishes over-prediction vs. under-prediction differently: for each sample j,
+  if \hat{y}_j > y_j: add exp((\hat{y}_j - y_j)/10) - 1
+  else: add exp((y_j - \hat{y}_j)/13) - 1
+- Captures risk preference: late warnings are penalized more than early ones.
+
+4) RUL capping for bounded target
+---------------------------------
+- Labels are capped at 115 cycles before training/testing to bound the regression target and reduce variance in early life.
+
+5) Explainability addition (separate script)
+-------------------------------------------
+- Integrated Gradients over time × sensor windows to attribute saliency per timestep and feature on saved FCN checkpoints.
+- Uses the exact model and physics loss custom objects for loading consistency.
+
+How to interpret novelty
+------------------------
+- The combination of masked monotonicity + slope tracking is data-driven (uses observed RUL deltas) yet physics-aligned (RUL should not increase and should decay smoothly).
+- Diagnostics (MonoViolation, SlopeRMSE) provide quantitative physics-consistency signals beyond RMSE/UPE.
+- Integrated Gradients yields interpretable attributions aligned with the physics-regularized model behavior.

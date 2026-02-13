@@ -1,0 +1,2 @@
+       (0)   index_min_loss:-1        min_val_loss:-1     RMSE:    13.901512     UPE:    405.807397    ER:(-45.466782,33.612728)    MonoViolation: 0.874325    SlopeRMSE: 21.152955
+    mean_score:     (13.901512)                 mean_RMSE:   13.901512     UPE:    405.807397    (-45.466782,33.612728)    MonoViolation: 0.874325    SlopeRMSE: 21.152955        
