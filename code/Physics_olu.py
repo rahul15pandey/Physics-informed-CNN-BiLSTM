@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Physics-informed FCN for CMAPSS RUL (monotonic degradation penalty)
+Physics-informed FCN for CMAPSS RUL (Dual Pooling + Asymmetric Loss)
 """
 import os
 import math
@@ -10,28 +10,25 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import keras
-import keras.backend as K
-from keras.layers import Lambda
+import tensorflow.keras.backend as K
+from keras.saving import register_keras_serializable 
 import CMAPSSDataset
 
-# Paths (use script location, not cwd, so saved models are found correctly)
+# Paths
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 last_last_path = os.path.abspath(os.path.join(_script_dir, "../.."))
 last_path = os.path.abspath(os.path.join(_script_dir, ".."))
 print(f"last_path: {last_path}")
 
-# Metrics
+# --- 1. Metrics ---
 
-def root_mean_squared_error(y_true, y_pred):
-    return K.sqrt(K.mean(K.square(y_pred - y_true), axis=0))
-
+def root_mean_squared_error_np(predictions, targets):
+    return np.sqrt(((predictions - targets) ** 2).mean())
 
 def rmse(predictions, targets):
     return np.sqrt(((predictions - targets) ** 2).mean())
 
-
 def physics_metrics_np(y_true, y_pred):
-    """Compute physics diagnostics on numpy arrays (monotonic violations and slope error)."""
     y_true_flat = y_true.reshape(-1)
     y_pred_flat = y_pred.reshape(-1)
     true_diffs = y_true_flat[1:] - y_true_flat[:-1]
@@ -44,19 +41,15 @@ def physics_metrics_np(y_true, y_pred):
     slope_rmse = math.sqrt(slope_sqerr.sum() / denom)
     return mono_mean, slope_rmse
 
-# Physics-inspired regularization to discourage RUL increases over time
-# and to keep predicted slopes close to observed slopes (data-driven linear prior).
-physics_alpha = 0.1   # weight for monotonicity penalty (no upward RUL jumps within an engine)
-physics_beta = 0.0    # optional curvature smoothing across windows
-physics_gamma = 0.05  # weight for slope tracking vs. observed RUL deltas
+# --- 2. Physics Loss (Enhanced for Score Reduction) ---
 
+# Weights are reduced to prevent fighting against MSE
+physics_alpha = 0.001   # Monotonicity weight (Low)
+physics_gamma = 0.001   # Slope weight (Low)
+# New: Penalty for over-estimating RUL (Late prediction = High Score Penalty)
+late_prediction_weight = 0.2 
 
 def _diff_mask(y_true, y_pred):
-    """Return diffs and a mask that is 1 only when consecutive samples are from the same engine.
-
-    Consecutive labels inside the same engine drop (negative delta). When a new engine begins,
-    the delta is positive; we mask those boundaries to avoid penalizing cross-engine jumps.
-    """
     y_true = K.flatten(y_true)
     y_pred = K.flatten(y_pred)
     true_diffs = y_true[1:] - y_true[:-1]
@@ -64,77 +57,85 @@ def _diff_mask(y_true, y_pred):
     same_engine_mask = K.cast(true_diffs < 0.0, K.floatx())
     return true_diffs, pred_diffs, same_engine_mask
 
-
+@register_keras_serializable()
 def physics_loss(y_true, y_pred):
     y_true_flat = K.flatten(y_true)
     y_pred_flat = K.flatten(y_pred)
+    
+    # 1. Standard MSE
     mse = K.mean(K.square(y_true_flat - y_pred_flat))
 
+    # 2. Asymmetric Penalty (Targets the CMAPSS Score)
+    # Penalize (Pred - True) ONLY if Pred > True
+    # This teaches the model to be conservative (underrate RUL slightly)
+    # which drastically reduces the Scoring metric.
+    over_estimation = K.relu(y_pred_flat - y_true_flat)
+    asymmetric_loss = K.mean(K.square(over_estimation))
+
+    # 3. Physics Constraints
     true_diffs, pred_diffs, same_engine_mask = _diff_mask(y_true_flat, y_pred_flat)
-
-    # Monotonicity: penalize upward jumps (positive deltas) only within engines.
     masked_pred_diffs = pred_diffs * same_engine_mask
+    
+    # Monotonicity
     mono_penalty = K.sum(K.relu(masked_pred_diffs)) / (K.sum(same_engine_mask) + K.epsilon())
-
-    # Linear decay prior: keep predicted slopes close to observed slopes inside each engine.
+    
+    # Slope
     slope_penalty = K.sum(K.square((pred_diffs - true_diffs) * same_engine_mask)) / (
         K.sum(same_engine_mask) + K.epsilon()
     )
 
-    # Optional curvature smoothing on predicted slopes (rarely used, kept for completeness).
-    if physics_beta > 0:
-        ddiffs = pred_diffs[1:] - pred_diffs[:-1]
-        smooth_penalty = K.mean(K.square(ddiffs))
-    else:
-        smooth_penalty = 0.0
+    return mse + (late_prediction_weight * asymmetric_loss) + (physics_alpha * mono_penalty) + (physics_gamma * slope_penalty)
 
-    return mse + physics_alpha * mono_penalty + physics_gamma * slope_penalty + physics_beta * smooth_penalty
-
-# Hyperparameters
+# --- 3. Hyperparameters ---
 num_test = 100
 run_times = 1
 nb_epochs = 200
-batch_size = 1024
-patience = 50
-patience_reduce_lr = 20
-num_filter1 = 64
-num_filter2 = 128
-num_filter3 = 64
-kernel1_size = 16
-kernel2_size = 10
-kernel3_size = 6
+batch_size = 1024  # Kept Large as requested
+patience = 40     
+patience_reduce_lr = 15
 
-# Storage for cross-FD summary
+# Architecture Params
+num_filter1 = 32
+num_filter2 = 64
+num_filter3 = 128 # Increased depth
+kernel1_size = 11 # Wider field of view
+kernel2_size = 9
+kernel3_size = 5
+
+# --- Helper: Exponential Smoothing ---
+def apply_exponential_smoothing(data, alpha=0.1):
+    """Smooths the features along the time axis."""
+    smoothed_data = np.copy(data)
+    # Manual loop to ensure compatibility
+    for i in range(smoothed_data.shape[0]): # Samples
+        for j in range(smoothed_data.shape[2]): # Features
+            # Simple vectorization for EMA
+            # s[t] = alpha*x[t] + (1-alpha)*s[t-1]
+            x = smoothed_data[i, :, j]
+            s = np.zeros_like(x)
+            s[0] = x[0]
+            for t in range(1, len(x)):
+                s[t] = alpha * x[t] + (1-alpha) * s[t-1]
+            smoothed_data[i, :, j] = s
+    return smoothed_data
+
 fd_summary = {}
 
-for FD in ['1','2']:#,'2','3','4']:  # []
-    # Feature selection per FD
+for FD in ['1', '2']: #, '3', '4']: 
     if FD == "1":
         sequence_length = 31
-        FD_feature_columns = [
-            "s2", "s3", "s4", "s6", "s7", "s8", "s9", "s11", "s12",
-            "s13", "s14", "s15", "s17", "s20", "s21",
-        ]
+        FD_feature_columns = ["s2", "s3", "s4", "s6", "s7", "s8", "s9", "s11", "s12", "s13", "s14", "s15", "s17", "s20", "s21"]
     if FD == "2":
         sequence_length = 21
-        FD_feature_columns = [
-            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
-            "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s19", "s20", "s21",
-        ]
+        FD_feature_columns = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s19", "s20", "s21"]
     if FD == "3":
         sequence_length = 38
-        FD_feature_columns = [
-            "s2", "s3", "s4", "s6", "s7", "s8", "s9", "s10", "s11", "s12",
-            "s13", "s14", "s15", "s17", "s20", "s21",
-        ]
+        FD_feature_columns = ["s2", "s3", "s4", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15", "s17", "s20", "s21"]
     if FD == "4":
         sequence_length = 19
-        FD_feature_columns = [
-            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
-            "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s20", "s21",
-        ]
+        FD_feature_columns = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s20", "s21"]
 
-    method_name = "grid_FD{}_without_num_test{}".format(FD, num_test)
+    method_name = "DualPooling_AsymLoss_FD{}_without_num_test{}".format(FD, num_test)
     dataset = "cmapssd"
 
     def unbalanced_penalty_score_1out(Y_test, Y_pred):
@@ -164,11 +165,6 @@ for FD in ['1','2']:#,'2','3','4']:  # []
     train_feature_slice = datasets.get_feature_slice(train_data)
     train_label_slice = datasets.get_label_slice(train_data)
 
-    print("train_data.shape: {}".format(train_data.shape))
-    print("train_feature_slice.shape: {}".format(train_feature_slice.shape))
-    print("train_label_slice.shape: {}".format(train_label_slice.shape))
-
-
     test_data = datasets.get_test_data()
     if num_test == 100:
         test_feature_slice, test_label_slice = datasets.get_last_data_slice(test_data)
@@ -176,9 +172,11 @@ for FD in ['1','2']:#,'2','3','4']:  # []
         test_feature_slice = datasets.get_feature_slice(test_data)
         test_label_slice = datasets.get_label_slice(test_data)
 
-    print("test_data.shape: {}".format(test_data.shape))
-    print("test_feature_slice.shape: {}".format(test_feature_slice.shape))
-    print("test_label_slice.shape: {}".format(test_label_slice.shape))
+    # --- APPLY SMOOTHING ---
+    # This reduces noise significantly, helping the large batch training converge
+    print("Applying Exponential Smoothing...")
+    train_feature_slice = apply_exponential_smoothing(train_feature_slice, alpha=0.3)
+    test_feature_slice = apply_exponential_smoothing(test_feature_slice, alpha=0.3)
 
     X_train = np.reshape(train_feature_slice, (-1, train_feature_slice.shape[1], 1, train_feature_slice.shape[2]))
     train_label_slice[train_label_slice > 115] = 115
@@ -190,23 +188,40 @@ for FD in ['1','2']:#,'2','3','4']:  # []
 
     print("X_train.shape: {}".format(X_train.shape))
     print("Y_train.shape: {}".format(Y_train.shape))
-    print("X_test.shape: {}".format(X_test.shape))
-    print("Y_test.shape: {}".format(Y_test.shape))
 
-    def FCN_model():
+    # --- Dual Pooling Model Architecture ---
+    def DualPooling_Model():
         in0 = keras.Input(shape=(X_train.shape[1], X_train.shape[2], X_train.shape[3]))
-        conv0 = keras.layers.Conv2D(num_filter1, kernel1_size, strides=1, padding="same", name="layer_9")(in0)
-        conv0 = keras.layers.BatchNormalization()(conv0)
-        conv0 = keras.layers.Activation("relu", name="layer_8")(conv0)
-        conv0 = keras.layers.Conv2D(num_filter2, kernel2_size, strides=1, padding="same", name="layer_7")(conv0)
-        conv0 = keras.layers.BatchNormalization()(conv0)
-        conv0 = keras.layers.Activation("relu", name="layer_6")(conv0)
-        conv0 = keras.layers.Conv2D(num_filter3, kernel3_size, strides=1, padding="same", name="layer_5")(conv0)
-        conv0 = keras.layers.BatchNormalization()(conv0)
-        conv0 = keras.layers.Activation("relu", name="layer_4")(conv0)
-        conv0 = keras.layers.GlobalAveragePooling2D(name="layer_3")(conv0)
-        conv0 = keras.layers.Dense(64, activation="relu", name="layer_2")(conv0)
-        out = keras.layers.Dense(1, activation="relu", name="layer_1")(conv0)
+        
+        # Block 1 - Wide Kernel
+        x = keras.layers.Conv2D(num_filter1, (kernel1_size, 1), strides=1, padding="same")(in0)
+        x = keras.layers.BatchNormalization()(x)
+        x = keras.layers.Activation("relu")(x)
+        
+        # Block 2
+        x = keras.layers.Conv2D(num_filter2, (kernel2_size, 1), strides=1, padding="same")(x)
+        x = keras.layers.BatchNormalization()(x)
+        x = keras.layers.Activation("relu")(x)
+        
+        # Block 3
+        x = keras.layers.Conv2D(num_filter3, (kernel3_size, 1), strides=1, padding="same")(x)
+        x = keras.layers.BatchNormalization()(x)
+        x = keras.layers.Activation("relu")(x)
+        
+        # --- Dual Pooling Strategy ---
+        # Average captures the general degradation trend.
+        # Max captures the sharpest fault signatures/noise spikes.
+        avg_pool = keras.layers.GlobalAveragePooling2D()(x)
+        max_pool = keras.layers.GlobalMaxPooling2D()(x)
+        
+        # Concatenate features
+        x = keras.layers.Concatenate()([avg_pool, max_pool])
+        
+        # --- Regularized Head ---
+        x = keras.layers.Dense(64, activation="relu")(x)
+        x = keras.layers.Dropout(0.5)(x) # Dropout is critical for large batch size
+        
+        out = keras.layers.Dense(1, activation="relu")(x)
         return keras.models.Model(inputs=in0, outputs=[out])
 
     if __name__ == "__main__":
@@ -230,10 +245,14 @@ for FD in ['1','2']:#,'2','3','4']:  # []
             os.remove(method_error_path)
 
         for i in range(run_times):
-            print("xxx")
-            model = FCN_model()
-            optimizer = keras.optimizers.Adam()
-            model.compile(loss=physics_loss, optimizer=optimizer, metrics=[root_mean_squared_error])
+            print(f"--- Run {i+1}/{run_times} ---")
+            model = DualPooling_Model()
+            
+            # Use Adam with a slightly higher learning rate for Batch 1024
+            optimizer = keras.optimizers.Adam(learning_rate=0.003)
+            
+            model.compile(loss=physics_loss, optimizer=optimizer, 
+                          metrics=[keras.metrics.RootMeanSquaredError(name="root_mean_squared_error")])
 
             reduce_lr = keras.callbacks.ReduceLROnPlateau(
                 monitor="loss", factor=0.5, patience=patience_reduce_lr, min_lr=0.0001
@@ -241,18 +260,19 @@ for FD in ['1','2']:#,'2','3','4']:  # []
             model_name = "{}_dataset_{}_run{}".format(method_name, dataset, i)
             model_path_full = os.path.join(model_dir, f"{model_name}.h5")
             already_trained = False
+            
             if os.path.exists(model_path_full):
-                print(f"Found existing checkpoint {model_path_full}, loading weights and skipping training.")
+                print(f"Found existing checkpoint {model_path_full}, loading weights.")
                 model = keras.models.load_model(
                     model_path_full,
-                    custom_objects={"root_mean_squared_error": root_mean_squared_error, "physics_loss": physics_loss},
+                    custom_objects={"physics_loss": physics_loss},
                 )
                 already_trained = True
             else:
                 earlystopping = keras.callbacks.EarlyStopping(monitor="loss", patience=patience, verbose=1)
                 modelcheckpoint = keras.callbacks.ModelCheckpoint(
                     monitor="loss",
-                    filepath=os.path.join(model_dir, f"{model_name}.h5"),
+                    filepath=model_path_full,
                     save_best_only=True,
                     verbose=1,
                 )
@@ -285,14 +305,16 @@ for FD in ['1','2']:#,'2','3','4']:  # []
                 plt.legend()
                 plt.show()
 
-            model = keras.models.load_model(
-                model_path_full,
-                custom_objects={"root_mean_squared_error": root_mean_squared_error, "physics_loss": physics_loss},
-            )
+                model = keras.models.load_model(
+                    model_path_full,
+                    custom_objects={"physics_loss": physics_loss},
+                )
+
             for layer in model.layers:
                 layer.trainable = False
 
             Y_pred = model.predict(X_test)
+            
             rmse_value = rmse(Y_test, Y_pred)
             print("rmse:{}".format(rmse_value))
 
@@ -303,13 +325,17 @@ for FD in ['1','2']:#,'2','3','4']:  # []
             unbalanced_penalty_score = unbalanced_penalty_score_1out(Y_test, Y_pred)
             error_range = error_range_1out(Y_test, Y_pred)
 
-            if not already_trained: # type: ignore
-                index_min_val_loss = log["loss"].idxmin()
-                min_val_loss = log["val_loss"].iloc[index_min_val_loss]
+            if not already_trained:
+                try:
+                    index_min_val_loss = log["loss"].idxmin()
+                    min_val_loss = log["val_loss"].iloc[index_min_val_loss]
+                except:
+                     index_min_val_loss, min_val_loss = -1, -1
                 index_min_val_loss_record.append(index_min_val_loss)
                 min_val_loss_record.append(min_val_loss)
             else:
                 index_min_val_loss, min_val_loss = -1, -1
+            
             error_record.append(rmse_value)
             unbalanced_penalty_score_record.append(unbalanced_penalty_score)
             error_range_left_record.append(error_range[0])
@@ -341,26 +367,36 @@ for FD in ['1','2']:#,'2','3','4']:  # []
         error_range_left_record = r1
         error_range_right_record = r2
         error_record = r3
+        
+        if error_record:
+            mean_rmse = np.mean(error_record)
+            mean_upe = np.mean(unbalanced_penalty_score_record)
+            mean_er_l = np.mean(error_range_left_record)
+            mean_er_r = np.mean(error_range_right_record)
+            mean_mono = np.mean(mono_violation_record)
+            mean_slope = np.mean(slope_rmse_record)
+        else:
+            mean_rmse = mean_upe = mean_er_l = mean_er_r = mean_mono = mean_slope = 0.0
+
         with open(method_error_path, "a") as file:
             file.write(
-                "    mean_score:" + "     (" + str(np.mean(error_record)) + ")     "
+                "    mean_score:" + "     (" + str(mean_rmse) + ")     "
                 + "       "
-                + "     mean_RMSE:   " + str("%.6f" % (np.mean(error_record)))
-                + "     UPE:    " + str("%.6f" % (np.mean(unbalanced_penalty_score_record)))
-                + "    (" + str("%.6f" % (np.mean(error_range_left_record)))
-                + "," + str("%.6f" % (np.mean(error_range_right_record)))
+                + "     mean_RMSE:   " + str("%.6f" % (mean_rmse))
+                + "     UPE:    " + str("%.6f" % (mean_upe))
+                + "    (" + str("%.6f" % (mean_er_l))
+                + "," + str("%.6f" % (mean_er_r))
                 + ")"
-                + "    MonoViolation: " + str("%.6f" % (np.mean(mono_violation_record)))
-                + "    SlopeRMSE: " + str("%.6f" % (np.mean(slope_rmse_record)))
+                + "    MonoViolation: " + str("%.6f" % (mean_mono))
+                + "    SlopeRMSE: " + str("%.6f" % (mean_slope))
                 + "        " + "\n"
             )
 
-        # Store summary for this FD
         fd_summary[FD] = {
-            "rmse": np.mean(error_record) if error_record else float('nan'),
-            "upe": np.mean(unbalanced_penalty_score_record) if unbalanced_penalty_score_record else float('nan'),
-            "mono": np.mean(mono_violation_record) if mono_violation_record else float('nan'),
-            "slope": np.mean(slope_rmse_record) if slope_rmse_record else float('nan'),
+            "rmse": mean_rmse if error_record else float('nan'),
+            "upe": mean_upe if unbalanced_penalty_score_record else float('nan'),
+            "mono": mean_mono if mono_violation_record else float('nan'),
+            "slope": mean_slope if slope_rmse_record else float('nan'),
         }
 
         error_record = []
@@ -370,14 +406,12 @@ for FD in ['1','2']:#,'2','3','4']:  # []
         mono_violation_record = []
         slope_rmse_record = []
 
-# After all FD datasets, generate summary plots and table
 if __name__ == "__main__" and fd_summary:
     print("\n=== Cross-FD Summary ===")
     for fd_key in sorted(fd_summary.keys()):
         s = fd_summary[fd_key]
         print(f"FD{fd_key}: RMSE={s['rmse']:.4f}, UPE={s['upe']:.2f}, Mono={s['mono']:.6f}, Slope={s['slope']:.4f}")
 
-    # Save summary CSV
     summary_csv_path = os.path.join(last_path, "experiments_result", "physics_fd_summary.csv")
     summary_df = pd.DataFrame([
         {"FD": f"FD{k}", "RMSE": v["rmse"], "UPE": v["upe"], "MonoViolation": v["mono"], "SlopeRMSE": v["slope"]}
@@ -386,7 +420,6 @@ if __name__ == "__main__" and fd_summary:
     summary_df.to_csv(summary_csv_path, index=False)
     print(f"Saved summary CSV to {summary_csv_path}")
 
-    # Comparison bar plots
     fig_dir = os.path.join(last_path, "figure", "physics_summary")
     os.makedirs(fig_dir, exist_ok=True)
     fds = [f"FD{k}" for k in sorted(fd_summary.keys())]
