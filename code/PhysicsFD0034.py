@@ -203,7 +203,7 @@ for FD in ["3", "4"]:
 
     # Paths for saving model and weights
     model_path = os.path.join(MODEL_DIR, f"FD00{FD}_model.h5")
-    weights_path = os.path.join(MODEL_DIR, f"FD00{FD}_weights.h5")
+    weights_path = os.path.join(MODEL_DIR, f"FD00{FD}_model.h5")
 
     history = None
 
