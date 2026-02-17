@@ -20,13 +20,15 @@ import CMAPSSDataset
 # Directory Setup
 # =============================
 
-BASE_DIR = os.getcwd()
+# Base folder: ...\Physics-informed-CNN-BiLSTM
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
 
-MODEL_DIR = os.path.join(BASE_DIR, "saved_models")
-LOG_DIR = os.path.join(BASE_DIR, "training_logs")
-PRED_DIR = os.path.join(BASE_DIR, "predictions")
-FIG_DIR = os.path.join(BASE_DIR, "figures")
-SUMMARY_DIR = os.path.join(BASE_DIR, "summary")
+MODEL_DIR   = os.path.join(PROJECT_ROOT, "saved_models")
+LOG_DIR     = os.path.join(PROJECT_ROOT, "training_logs")
+PRED_DIR    = os.path.join(PROJECT_ROOT, "predictions")
+FIG_DIR     = os.path.join(PROJECT_ROOT, "figures")
+SUMMARY_DIR = os.path.join(PROJECT_ROOT, "summary")
 
 for d in [MODEL_DIR, LOG_DIR, PRED_DIR, FIG_DIR, SUMMARY_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -276,4 +278,3 @@ summary_csv_path = os.path.join(SUMMARY_DIR, "FD003_FD004_summary.csv")
 summary_df.to_csv(summary_csv_path, index=False)
 
 print("\nSaved everything successfully.")
-    
