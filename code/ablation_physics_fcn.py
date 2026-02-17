@@ -634,59 +634,85 @@ def generate_latex_table(results: List[Dict], out_path: str, fd: str):
 
 
 # =========================================================================
-# Main
+# Cross-dataset summary plots (for --fd all)
 # =========================================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="Ablation study for PI-DP-FCN RUL prediction")
-    parser.add_argument("--fd", default="1", help="FD sub-dataset: 1, 2, 3, 4")
-    parser.add_argument("--num_test", type=int, default=100, choices=[100, 10000])
-    parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--lr", type=float, default=0.003)
-    parser.add_argument("--patience", type=int, default=40)
-    parser.add_argument("--patience_reduce_lr", type=int, default=15)
-    parser.add_argument("--num_filter1", type=int, default=32)
-    parser.add_argument("--num_filter2", type=int, default=64)
-    parser.add_argument("--num_filter3", type=int, default=128)
-    parser.add_argument("--k1", type=int, default=11)
-    parser.add_argument("--k2", type=int, default=9)
-    parser.add_argument("--k3", type=int, default=5)
-    parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--smoothing_alpha", type=float, default=0.3)
-    parser.add_argument("--force_retrain", action="store_true",
-                        help="Force retraining even if cached weights/results exist")
-    parser.add_argument("--out_root", default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "experiments_result")))
-    args = parser.parse_args()
+def plot_cross_fd_grouped(all_fd_results: Dict[str, List[Dict]], metric_key: str,
+                          metric_label: str, out_path: str):
+    """Grouped bar chart: configs (x-axis) grouped by FD dataset, for one metric."""
+    fd_keys = sorted(all_fd_results.keys())
+    # Use the config names from the first FD (they are the same across FDs)
+    config_names = [r["display_name"] for r in all_fd_results[fd_keys[0]]]
+    n_fds = len(fd_keys)
+    n_configs = len(config_names)
+    x = np.arange(n_configs)
+    width = 0.8 / n_fds
 
-    # Override defaults for multi-condition datasets
-    if args.fd in ("3", "4"):
-        if args.batch_size == 1024:
-            args.batch_size = 256
-        if args.lr == 0.003:
-            args.lr = 0.001
-        if args.dropout == 0.5:
-            args.dropout = 0.3
-        if args.smoothing_alpha == 0.3:
-            args.smoothing_alpha = 0.1
+    fig, ax = plt.subplots(figsize=(max(10, 2.5 * n_configs), 5))
+    for fd_idx, fd_key in enumerate(fd_keys):
+        vals = [r[metric_key] for r in all_fd_results[fd_key]]
+        offset = (fd_idx - (n_fds - 1) / 2) * width
+        bars = ax.bar(
+            x + offset, vals, width,
+            label=f"FD00{fd_key}",
+            color=COLORS[fd_idx % len(COLORS)],
+            edgecolor="black", linewidth=0.4,
+        )
+        for bar, val in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{val:.1f}", ha="center", va="bottom", fontsize=7, fontweight="bold",
+            )
 
-    args.out_ablation = os.path.join(args.out_root, "ablation")
-    args.out_ablation_csv = os.path.join(args.out_root, "ablation_csv")
-    args.out_models = os.path.join(args.out_root, "ablation_models")
-    for d in [args.out_ablation, args.out_ablation_csv, args.out_models]:
-        os.makedirs(d, exist_ok=True)
+    ax.set_xticks(x)
+    ax.set_xticklabels(config_names, rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel(metric_label, fontweight="bold")
+    ax.set_title(f"Ablation: {metric_label} across all FD datasets", fontweight="bold")
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
-    print(f"\n{'='*60}")
-    print(f"  ABLATION STUDY – FD{args.fd}")
-    print(f"  Epochs={args.epochs}  Batch={args.batch_size}  LR={args.lr}")
-    print(f"{'='*60}\n")
 
-    X_train, Y_train, X_test, Y_test = load_data(
-        args.fd, args.num_test, args.batch_size, args.smoothing_alpha
-    )
+def generate_cross_fd_latex(all_fd_results: Dict[str, List[Dict]], out_path: str):
+    """Write a single LaTeX table summarising Full Proposed across all FDs."""
+    lines = [
+        r"\begin{table}[H]",
+        r"\centering",
+        r"\caption{Cross-dataset results for the Full Proposed model.}",
+        r"\label{tab:cross_fd}",
+        r"\small",
+        r"\begin{tabular}{@{}lcccc@{}}",
+        r"\toprule",
+        r"\textbf{Dataset} & \textbf{RMSE} $\downarrow$ & \textbf{Score} $\downarrow$ & \textbf{Mono} $\downarrow$ & \textbf{Slope} $\downarrow$ \\",
+        r"\midrule",
+    ]
+    for fd_key in sorted(all_fd_results.keys()):
+        # Get the Full Proposed result (last config)
+        full = all_fd_results[fd_key][-1]
+        lines.append(
+            f"FD00{fd_key} & {full['rmse']:.2f} & {full['score']:.2f} & "
+            f"{full['mono']:.4f} & {full['slope']:.2f} \\\\"
+        )
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"  Saved cross-FD LaTeX table to {out_path}")
 
-    # ---- Ablation configurations ----
-    # Mirrors the LaTeX document's ablation table
+
+# =========================================================================
+# Per-FD ablation runner
+# =========================================================================
+
+def get_fd_defaults(fd: str):
+    """Return dataset-specific defaults for batch_size, lr, dropout, smoothing."""
+    if fd in ("3", "4"):
+        return {"batch_size": 256, "lr": 0.001, "dropout": 0.3, "smoothing_alpha": 0.1}
+    return {"batch_size": 1024, "lr": 0.003, "dropout": 0.5, "smoothing_alpha": 0.3}
+
+
+def get_configs(fd: str) -> List[Dict]:
+    """Return the ablation configurations for a given FD dataset."""
     configs = [
         {
             "name": "mse_only",
@@ -708,25 +734,59 @@ def main():
             "display_name": "MSE+Mono+Slope",
             "alpha": 0.001, "gamma": 0.001, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
         },
-        {
-            "name": "mse_asym_mono_slope",
-            "display_name": "MSE+Asym+Mono+Slope",
-            "alpha": 0.001, "gamma": 0.001, "asym_weight": 0.2, "score_weight": 0.0, "smooth_weight": 0.0,
-        },
     ]
 
-    # Add full proposed (with score loss) for FD003/004
-    if args.fd in ("3", "4"):
+    if fd in ("3", "4"):
+        # Extra config without score, then full proposed with score loss
+        configs.append({
+            "name": "mse_asym_mono_slope",
+            "display_name": "MSE+Asym+Mono+Slope",
+            "alpha": 0.005, "gamma": 0.003, "asym_weight": 0.4, "score_weight": 0.0, "smooth_weight": 0.0,
+        })
         configs.append({
             "name": "full_proposed",
             "display_name": "Full Proposed",
             "alpha": 0.005, "gamma": 0.003, "asym_weight": 0.4, "score_weight": 0.1, "smooth_weight": 0.0,
         })
     else:
-        # For FD001/002 the full model is asym+mono+slope (same as last config)
-        configs[-1]["name"] = "full_proposed"
-        configs[-1]["display_name"] = "Full Proposed"
+        # For FD001/002 the full model is asym+mono+slope
+        configs.append({
+            "name": "full_proposed",
+            "display_name": "Full Proposed",
+            "alpha": 0.001, "gamma": 0.001, "asym_weight": 0.2, "score_weight": 0.0, "smooth_weight": 0.0,
+        })
 
+    return configs
+
+
+def run_ablation_for_fd(fd: str, args) -> List[Dict]:
+    """Run the full ablation study for one FD dataset and save per-FD outputs."""
+    # --- Apply FD-specific defaults (only override if the user didn't set them) ---
+    defaults = get_fd_defaults(fd)
+    effective_args = argparse.Namespace(**vars(args))
+    effective_args.fd = fd
+    if not args._user_set_batch_size:
+        effective_args.batch_size = defaults["batch_size"]
+    if not args._user_set_lr:
+        effective_args.lr = defaults["lr"]
+    if not args._user_set_dropout:
+        effective_args.dropout = defaults["dropout"]
+    if not args._user_set_smoothing:
+        effective_args.smoothing_alpha = defaults["smoothing_alpha"]
+
+    print(f"\n{'='*60}")
+    print(f"  ABLATION STUDY – FD00{fd}")
+    print(f"  Epochs={effective_args.epochs}  Batch={effective_args.batch_size}  "
+          f"LR={effective_args.lr}  Dropout={effective_args.dropout}  "
+          f"Smooth={effective_args.smoothing_alpha}")
+    print(f"{'='*60}\n")
+
+    X_train, Y_train, X_test, Y_test = load_data(
+        fd, effective_args.num_test, effective_args.batch_size,
+        effective_args.smoothing_alpha,
+    )
+
+    configs = get_configs(fd)
     results = []
     for cfg in configs:
         print(f"\n{'─'*50}")
@@ -742,7 +802,7 @@ def main():
             score_weight=cfg["score_weight"],
             smooth_weight=cfg["smooth_weight"],
         )
-        res = run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg, args)
+        res = run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg, effective_args)
         results.append(res)
 
     # =====================
@@ -762,35 +822,27 @@ def main():
         for r in results
     ])
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(args.out_ablation_csv, f"ablation_fd{args.fd}_{ts}.csv")
+    csv_path = os.path.join(effective_args.out_ablation_csv, f"ablation_fd{fd}_{ts}.csv")
     df.to_csv(csv_path, index=False)
     print(f"\nSaved metrics CSV to {csv_path}")
 
     # =====================
-    # Generate all plots
+    # Generate per-FD plots
     # =====================
-    prefix = os.path.join(args.out_ablation, f"fd{args.fd}")
-    fd_label = f"FD00{args.fd}"
-
+    prefix = os.path.join(effective_args.out_ablation, f"fd{fd}")
+    fd_label = f"FD00{fd}"
     metrics_list = [("rmse", "RMSE"), ("score", "NASA Score"), ("mono", "Mono Violation"), ("slope", "Slope RMSE")]
 
-    # 1) Grouped bar charts (individual per metric)
     plot_grouped_bars(
         results, metrics_list,
         f"{prefix}_grouped_bars.png",
         f"Ablation Study – {fd_label}: All Metrics"
     )
-    print(f"  Saved grouped bar chart")
-
-    # 2) Radar chart
     plot_radar(
         results, metrics_list,
         f"{prefix}_radar.png",
         f"Ablation Study – {fd_label}: Radar Overview"
     )
-    print(f"  Saved radar chart")
-
-    # 3) Loss convergence curves
     plot_loss_curves(
         results, f"{prefix}_loss_curves.png",
         f"Ablation Study – {fd_label}: Loss Convergence"
@@ -800,16 +852,10 @@ def main():
         f"Ablation Study – {fd_label}: Loss Convergence (Log Scale)",
         log_scale=True,
     )
-    print(f"  Saved loss curves (linear + log)")
-
-    # 4) Prediction scatter plots
     plot_scatter_predictions(
         results, f"{prefix}_scatter.png",
         f"Ablation Study – {fd_label}: True vs Predicted RUL"
     )
-    print(f"  Saved scatter plots")
-
-    # 5) Waterfall charts for RMSE and Score
     plot_improvement_waterfall(
         results, "rmse", "RMSE",
         f"{prefix}_waterfall_rmse.png",
@@ -820,25 +866,154 @@ def main():
         f"{prefix}_waterfall_score.png",
         f"NASA Score Improvement Waterfall – {fd_label}"
     )
-    print(f"  Saved waterfall charts")
+    generate_latex_table(results, f"{prefix}_ablation_table.tex", fd)
 
-    # 6) LaTeX table
-    generate_latex_table(
-        results, f"{prefix}_ablation_table.tex", args.fd
-    )
+    print(f"\n  All per-FD plots saved for {fd_label}")
 
-    print(f"\n{'='*60}")
-    print(f"  ABLATION COMPLETE – FD{args.fd}")
-    print(f"  All outputs saved to {args.out_ablation}")
-    print(f"{'='*60}")
-
-    # Print summary
+    # Print summary table
     print(f"\n{'─'*70}")
     print(f"{'Config':<25} {'RMSE':>8} {'Score':>10} {'Mono':>8} {'Slope':>8}")
     print(f"{'─'*70}")
     for r in results:
         print(f"{r['display_name']:<25} {r['rmse']:>8.2f} {r['score']:>10.2f} {r['mono']:>8.4f} {r['slope']:>8.4f}")
     print(f"{'─'*70}")
+
+    return results
+
+
+# =========================================================================
+# Main
+# =========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Ablation study for PI-DP-FCN RUL prediction")
+    parser.add_argument("--fd", default="1",
+                        help="FD sub-dataset: 1, 2, 3, 4, or 'all' to run all four")
+    parser.add_argument("--num_test", type=int, default=100, choices=[100, 10000])
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Batch size (default: auto per FD)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate (default: auto per FD)")
+    parser.add_argument("--patience", type=int, default=40)
+    parser.add_argument("--patience_reduce_lr", type=int, default=15)
+    parser.add_argument("--num_filter1", type=int, default=32)
+    parser.add_argument("--num_filter2", type=int, default=64)
+    parser.add_argument("--num_filter3", type=int, default=128)
+    parser.add_argument("--k1", type=int, default=11)
+    parser.add_argument("--k2", type=int, default=9)
+    parser.add_argument("--k3", type=int, default=5)
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Dropout rate (default: auto per FD)")
+    parser.add_argument("--smoothing_alpha", type=float, default=None,
+                        help="EMA smoothing alpha (default: auto per FD)")
+    parser.add_argument("--force_retrain", action="store_true",
+                        help="Force retraining even if cached weights/results exist")
+    parser.add_argument("--out_root", default=os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "experiments_result")))
+    args = parser.parse_args()
+
+    # Track which args the user explicitly set vs auto-defaults
+    args._user_set_batch_size = args.batch_size is not None
+    args._user_set_lr = args.lr is not None
+    args._user_set_dropout = args.dropout is not None
+    args._user_set_smoothing = args.smoothing_alpha is not None
+
+    # Fill in defaults so downstream code always has values
+    if args.batch_size is None:
+        args.batch_size = 1024
+    if args.lr is None:
+        args.lr = 0.003
+    if args.dropout is None:
+        args.dropout = 0.5
+    if args.smoothing_alpha is None:
+        args.smoothing_alpha = 0.3
+
+    # Setup output directories
+    args.out_ablation = os.path.join(args.out_root, "ablation")
+    args.out_ablation_csv = os.path.join(args.out_root, "ablation_csv")
+    args.out_models = os.path.join(args.out_root, "ablation_models")
+    for d in [args.out_ablation, args.out_ablation_csv, args.out_models]:
+        os.makedirs(d, exist_ok=True)
+
+    # ---- Determine which FDs to run ----
+    if args.fd.lower() == "all":
+        fd_list = ["1", "2", "3", "4"]
+    else:
+        fd_list = [args.fd]
+
+    # ---- Run ablation for each FD ----
+    all_fd_results: Dict[str, List[Dict]] = {}
+    for fd in fd_list:
+        results = run_ablation_for_fd(fd, args)
+        all_fd_results[fd] = results
+
+    # ---- Cross-dataset summary (when multiple FDs) ----
+    if len(fd_list) > 1:
+        print(f"\n{'#'*60}")
+        print(f"  CROSS-DATASET SUMMARY")
+        print(f"{'#'*60}")
+
+        # 1) Cross-FD grouped bar charts
+        # We need all FDs to have the same configs for grouped bars.
+        # Use only configs present in ALL FDs (intersection by display_name).
+        common_names = None
+        for fd_key in sorted(all_fd_results.keys()):
+            names = {r["display_name"] for r in all_fd_results[fd_key]}
+            common_names = names if common_names is None else common_names & names
+
+        # Filter results to common configs, preserving order
+        filtered_fd_results: Dict[str, List[Dict]] = {}
+        for fd_key in sorted(all_fd_results.keys()):
+            filtered_fd_results[fd_key] = [
+                r for r in all_fd_results[fd_key] if r["display_name"] in common_names
+            ]
+
+        cross_prefix = os.path.join(args.out_ablation, "cross_fd")
+        for metric_key, metric_label in [("rmse", "RMSE"), ("score", "NASA Score"),
+                                          ("mono", "Mono Violation"), ("slope", "Slope RMSE")]:
+            plot_cross_fd_grouped(
+                filtered_fd_results, metric_key, metric_label,
+                f"{cross_prefix}_{metric_key}.png",
+            )
+        print("  Saved cross-FD grouped bar charts")
+
+        # 2) Cross-FD LaTeX table (Full Proposed only)
+        generate_cross_fd_latex(all_fd_results, f"{cross_prefix}_table.tex")
+
+        # 3) Cross-FD CSV
+        cross_rows = []
+        for fd_key in sorted(all_fd_results.keys()):
+            for r in all_fd_results[fd_key]:
+                cross_rows.append({
+                    "FD": f"FD00{fd_key}",
+                    "config": r["display_name"],
+                    "rmse": r["rmse"],
+                    "nasa_score": r["score"],
+                    "mono": r["mono"],
+                    "slope": r["slope"],
+                })
+        cross_df = pd.DataFrame(cross_rows)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        cross_csv_path = os.path.join(args.out_ablation_csv, f"ablation_all_fd_{ts}.csv")
+        cross_df.to_csv(cross_csv_path, index=False)
+        print(f"  Saved cross-FD CSV to {cross_csv_path}")
+
+        # 4) Print grand summary
+        print(f"\n{'─'*78}")
+        print(f"{'FD':<8} {'Config':<25} {'RMSE':>8} {'Score':>10} {'Mono':>8} {'Slope':>8}")
+        print(f"{'─'*78}")
+        for fd_key in sorted(all_fd_results.keys()):
+            full = all_fd_results[fd_key][-1]  # Full Proposed is always last
+            print(f"FD00{fd_key:<4} {full['display_name']:<25} "
+                  f"{full['rmse']:>8.2f} {full['score']:>10.2f} "
+                  f"{full['mono']:>8.4f} {full['slope']:>8.2f}")
+        print(f"{'─'*78}")
+
+    print(f"\n{'='*60}")
+    print(f"  ALL ABLATIONS COMPLETE")
+    print(f"  Outputs: {args.out_ablation}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
