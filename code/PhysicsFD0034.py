@@ -37,10 +37,10 @@ for d in [MODEL_DIR, LOG_DIR, PRED_DIR, FIG_DIR, SUMMARY_DIR]:
 # Loss Definition
 # =============================
 
-physics_alpha = 0.005
-physics_gamma = 0.003
-late_prediction_weight = 0.4
-score_weight = 0.1
+physics_alpha = 0.002
+physics_gamma = 0.0005
+late_prediction_weight = 0.08
+score_weight = 0.02
 
 def _diff_mask(y_true, y_pred):
     y_true = K.flatten(y_true)
@@ -98,6 +98,25 @@ def apply_exponential_smoothing(data, alpha=0.1):
     return smoothed
 
 # =============================
+# Squeeze-and-Excitation Attention
+# =============================
+
+def se_block(x, ratio=8):
+    """Squeeze-and-Excitation: learns per-channel importance weights.
+
+    Adaptively recalibrates feature maps so the network focuses on the
+    most informative degradation channels.  Ref: Hu et al., CVPR 2018.
+    """
+    filters = int(x.shape[-1])
+    se = keras.layers.GlobalAveragePooling2D()(x)
+    se = keras.layers.Dense(max(filters // ratio, 4), activation='relu',
+                            kernel_initializer='he_normal')(se)
+    se = keras.layers.Dense(filters, activation='sigmoid',
+                            kernel_initializer='he_normal')(se)
+    se = keras.layers.Reshape((1, 1, filters))(se)
+    return keras.layers.Multiply()([x, se])
+
+# =============================
 # Model
 # =============================
 
@@ -108,18 +127,22 @@ def build_model(input_shape):
     x = keras.layers.Conv2D(32, (11, 1), padding="same")(inputs)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
     x = keras.layers.Conv2D(64, (9, 1), padding="same")(x)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
     x = keras.layers.Conv2D(128, (5, 1), padding="same")(x)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
     x = keras.layers.Conv2D(256, (3, 1), padding="same")(x)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
     avg_pool = keras.layers.GlobalAveragePooling2D()(x)
     max_pool = keras.layers.GlobalMaxPooling2D()(x)
@@ -193,7 +216,15 @@ for FD in ["3", "4"]:
     # ================= MODEL BUILD / LOAD =================
     model = build_model(X_train.shape[1:])
 
-    optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+    # Cosine-decay LR schedule + gradient clipping for stable convergence
+    steps_per_epoch = max(1, len(X_train) // batch_size)
+    total_steps = epochs * steps_per_epoch
+    cosine_lr = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=learning_rate,
+        decay_steps=total_steps,
+        alpha=1e-5,
+    )
+    optimizer = keras.optimizers.Adam(learning_rate=cosine_lr, clipnorm=1.0)
 
     model.compile(
         loss=physics_loss,

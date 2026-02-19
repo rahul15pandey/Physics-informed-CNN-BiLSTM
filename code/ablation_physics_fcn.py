@@ -34,7 +34,12 @@ import pandas as pd
 import tensorflow as tf
 import keras
 import keras.backend as K
+from scipy.signal import lfilter, lfilter_zi
 import CMAPSSDataset
+
+# ---------- GPU memory growth ----------
+for _gpu in tf.config.list_physical_devices("GPU"):
+    tf.config.experimental.set_memory_growth(_gpu, True)
 
 # =========================================================================
 # Global plot style (publication quality)
@@ -106,16 +111,20 @@ def error_range_1out(Y_test, Y_pred):
 # =========================================================================
 
 def apply_exponential_smoothing(data: np.ndarray, alpha: float = 0.1) -> np.ndarray:
-    smoothed = np.copy(data)
-    for i in range(smoothed.shape[0]):
-        for j in range(smoothed.shape[2]):
-            x = smoothed[i, :, j]
-            s = np.zeros_like(x)
-            s[0] = x[0]
-            for t in range(1, len(x)):
-                s[t] = alpha * x[t] + (1 - alpha) * s[t - 1]
-            smoothed[i, :, j] = s
-    return smoothed
+    """Vectorised EMA along the time axis using scipy IIR filter.
+
+    Matches the original formula: s[0]=x[0], s[t]=alpha*x[t]+(1-alpha)*s[t-1].
+    Uses lfilter_zi to set proper initial conditions so y[0]=x[0].
+    """
+    b = np.array([alpha], dtype=np.float64)
+    a = np.array([1.0, -(1.0 - alpha)], dtype=np.float64)
+    zi = lfilter_zi(b, a)  # shape (1,)
+    smoothed = np.empty_like(data)
+    for j in range(data.shape[2]):
+        x_2d = data[:, :, j].astype(np.float64)
+        zi_2d = zi * x_2d[:, 0:1]  # (n_samples, 1)
+        smoothed[:, :, j], _ = lfilter(b, a, x_2d, axis=1, zi=zi_2d)
+    return smoothed.astype(np.float32)
 
 
 # =========================================================================
@@ -181,6 +190,26 @@ def make_physics_loss(
 
 
 # =========================================================================
+# Squeeze-and-Excitation (SE) channel attention
+# =========================================================================
+
+def se_block(x, ratio=8):
+    """Squeeze-and-Excitation: learns per-channel importance weights.
+
+    Adaptively recalibrates feature maps so the network focuses on the
+    most informative degradation channels.  Ref: Hu et al., CVPR 2018.
+    """
+    filters = int(x.shape[-1])
+    se = keras.layers.GlobalAveragePooling2D()(x)
+    se = keras.layers.Dense(max(filters // ratio, 4), activation='relu',
+                            kernel_initializer='he_normal')(se)
+    se = keras.layers.Dense(filters, activation='sigmoid',
+                            kernel_initializer='he_normal')(se)
+    se = keras.layers.Reshape((1, 1, filters))(se)
+    return keras.layers.Multiply()([x, se])
+
+
+# =========================================================================
 # Model builder (Dual-Pooling architecture matching the main model)
 # =========================================================================
 
@@ -195,23 +224,26 @@ def build_fcn(
     use_dual_pool=True,
     dropout_rate=0.5,
 ):
-    """Build the PI-DP-FCN ablation model (matches Physics_olu.py architecture)."""
+    """Build the PI-DP-FCN ablation model (matches Physics_olu.py architecture for FD001/002)."""
     in0 = keras.Input(shape=input_shape)
 
-    # Block 1
+    # Block 1 + SE
     x = keras.layers.Conv2D(num_filter1, (k1, 1), strides=1, padding="same")(in0)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
-    # Block 2
+    # Block 2 + SE
     x = keras.layers.Conv2D(num_filter2, (k2, 1), strides=1, padding="same")(x)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
-    # Block 3
+    # Block 3 + SE
     x = keras.layers.Conv2D(num_filter3, (k3, 1), strides=1, padding="same")(x)
     x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
 
     # Pooling
     if use_dual_pool:
@@ -220,6 +252,53 @@ def build_fcn(
         x = keras.layers.Concatenate()([avg_pool, max_pool])
     else:
         x = keras.layers.GlobalAveragePooling2D()(x)
+
+    # Head
+    x = keras.layers.Dense(64, activation="relu")(x)
+    x = keras.layers.Dropout(dropout_rate)(x)
+    out = keras.layers.Dense(1, activation="relu")(x)
+    return keras.models.Model(inputs=in0, outputs=[out])
+
+
+def build_fcn_deep(
+    input_shape,
+    dropout_rate=0.3,
+):
+    """Build 4-block deeper FCN for FD003/004 (matches PhysicsFD0034.py architecture).
+
+    Architecture: Conv32(11) -> Conv64(9) -> Conv128(5) -> Conv256(3)
+    with Dual Pooling and dropout head.
+    """
+    in0 = keras.Input(shape=input_shape)
+
+    # Block 1 + SE
+    x = keras.layers.Conv2D(32, (11, 1), padding="same")(in0)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
+
+    # Block 2 + SE
+    x = keras.layers.Conv2D(64, (9, 1), padding="same")(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
+
+    # Block 3 + SE
+    x = keras.layers.Conv2D(128, (5, 1), padding="same")(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
+
+    # Block 4 (extra depth for multi-condition FD003/004) + SE
+    x = keras.layers.Conv2D(256, (3, 1), padding="same")(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Activation("relu")(x)
+    x = se_block(x)
+
+    # Dual Pooling
+    avg_pool = keras.layers.GlobalAveragePooling2D()(x)
+    max_pool = keras.layers.GlobalMaxPooling2D()(x)
+    x = keras.layers.Concatenate()([avg_pool, max_pool])
 
     # Head
     x = keras.layers.Dense(64, activation="relu")(x)
@@ -286,7 +365,8 @@ def load_data(
 # Training + evaluation for one config
 # =========================================================================
 
-def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args) -> Dict:
+def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args,
+               model_builder=None) -> Dict:
     tf.random.set_seed(42)
     np.random.seed(42)
 
@@ -298,18 +378,29 @@ def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args) -> Di
     history_path = os.path.join(model_dir, f"history_{cfg['name']}_fd{args.fd}.json")
     preds_path = os.path.join(model_dir, f"preds_{cfg['name']}_fd{args.fd}.npz")
 
-    # --- Build model (always needed for architecture) ---
-    model = build_fcn(
-        input_shape=(X_train.shape[1], X_train.shape[2], X_train.shape[3]),
-        num_filter1=args.num_filter1,
-        num_filter2=args.num_filter2,
-        num_filter3=args.num_filter3,
-        k1=args.k1,
-        k2=args.k2,
-        k3=args.k3,
-        dropout_rate=args.dropout,
+    # --- Build model (use custom builder if provided) ---
+    input_shape = (X_train.shape[1], X_train.shape[2], X_train.shape[3])
+    if model_builder is not None:
+        model = model_builder(input_shape)
+    else:
+        model = build_fcn(
+            input_shape=input_shape,
+            num_filter1=args.num_filter1,
+            num_filter2=args.num_filter2,
+            num_filter3=args.num_filter3,
+            k1=args.k1,
+            k2=args.k2,
+            k3=args.k3,
+            dropout_rate=args.dropout,
+        )
+    # Cosine-decay LR + gradient clipping for stable convergence
+    steps_per_epoch = max(1, len(X_train) // args.batch_size)
+    cosine_lr = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=args.lr,
+        decay_steps=args.epochs * steps_per_epoch,
+        alpha=1e-5,
     )
-    optimizer = keras.optimizers.Adam(learning_rate=args.lr)
+    optimizer = keras.optimizers.Adam(learning_rate=cosine_lr, clipnorm=1.0)
     model.compile(loss=loss_fn, optimizer=optimizer, metrics=[root_mean_squared_error])
 
     # --- Check if we can reuse a cached run ---
@@ -362,10 +453,16 @@ def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args) -> Di
     # ---- TRAIN from scratch ----
     print(f"  [TRAINING] No cache found (or --force_retrain). Training...")
 
-    cb = [
-        keras.callbacks.ReduceLROnPlateau(monitor="loss", factor=0.5, patience=args.patience_reduce_lr, min_lr=1e-5),
-        keras.callbacks.EarlyStopping(monitor="loss", patience=args.patience, verbose=1, restore_best_weights=True),
-    ]
+    # FD-specific training behavior
+    use_shuffle = getattr(args, '_shuffle', False)
+    use_callbacks = getattr(args, '_use_callbacks', True)
+
+    cb = []
+    if use_callbacks:
+        cb = [
+            keras.callbacks.ReduceLROnPlateau(monitor="loss", factor=0.5, patience=args.patience_reduce_lr, min_lr=1e-5),
+            keras.callbacks.EarlyStopping(monitor="loss", patience=args.patience, verbose=1, restore_best_weights=True),
+        ]
 
     hist = model.fit(
         X_train,
@@ -375,7 +472,7 @@ def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args) -> Di
         verbose=1,
         validation_data=(X_test, Y_test),
         callbacks=cb,
-        shuffle=False,
+        shuffle=use_shuffle,
     )
 
     # ---- SAVE everything ----
@@ -705,56 +802,100 @@ def generate_cross_fd_latex(all_fd_results: Dict[str, List[Dict]], out_path: str
 # =========================================================================
 
 def get_fd_defaults(fd: str):
-    """Return dataset-specific defaults for batch_size, lr, dropout, smoothing."""
+    """Return dataset-specific defaults for batch_size, lr, dropout, smoothing, epochs.
+
+    All datasets use epochs=200, shuffle=True.
+    FD003/004: 4-block deep architecture, batch=256, lr=0.001, dropout=0.3,
+               smoothing_alpha=0.1, no callbacks.
+    FD001/002: 3-block architecture, batch=1024, lr=0.003, dropout=0.5,
+               smoothing_alpha=0.3, with callbacks.
+    """
     if fd in ("3", "4"):
-        return {"batch_size": 256, "lr": 0.001, "dropout": 0.3, "smoothing_alpha": 0.1}
-    return {"batch_size": 1024, "lr": 0.003, "dropout": 0.5, "smoothing_alpha": 0.3}
+        return {
+            "batch_size": 256, "lr": 0.001, "dropout": 0.3,
+            "smoothing_alpha": 0.1, "epochs": 200,
+            "shuffle": True, "use_callbacks": False,
+            "use_deep_model": True,
+        }
+    return {
+        "batch_size": 1024, "lr": 0.003, "dropout": 0.5,
+        "smoothing_alpha": 0.3, "epochs": 200,
+        "shuffle": True, "use_callbacks": True,
+        "use_deep_model": False,
+    }
 
 
 def get_configs(fd: str) -> List[Dict]:
-    """Return the ablation configurations for a given FD dataset."""
-    configs = [
-        {
-            "name": "mse_only",
-            "display_name": "MSE Only",
-            "alpha": 0.0, "gamma": 0.0, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
-        },
-        {
-            "name": "mse_asym",
-            "display_name": "MSE+Asym",
-            "alpha": 0.0, "gamma": 0.0, "asym_weight": 0.2, "score_weight": 0.0, "smooth_weight": 0.0,
-        },
-        {
-            "name": "mse_mono",
-            "display_name": "MSE+Mono",
-            "alpha": 0.001, "gamma": 0.0, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
-        },
-        {
-            "name": "mse_mono_slope",
-            "display_name": "MSE+Mono+Slope",
-            "alpha": 0.001, "gamma": 0.001, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
-        },
-    ]
+    """Return the ablation configurations for a given FD dataset.
 
-    if fd in ("3", "4"):
-        # Extra config without score, then full proposed with score loss
-        configs.append({
-            "name": "mse_asym_mono_slope",
-            "display_name": "MSE+Asym+Mono+Slope",
-            "alpha": 0.005, "gamma": 0.003, "asym_weight": 0.4, "score_weight": 0.0, "smooth_weight": 0.0,
-        })
-        configs.append({
-            "name": "full_proposed",
-            "display_name": "Full Proposed",
-            "alpha": 0.005, "gamma": 0.003, "asym_weight": 0.4, "score_weight": 0.1, "smooth_weight": 0.0,
-        })
+    Weight rationale:
+    - asym kept LOW (0.05 FD1/2, 0.08 FD3/4) to avoid prediction bias
+    - slope << mono so monotonicity dominates while slope refines
+    - score proxy at very low weight (FD3/4 only) for NASA-score alignment
+    - Full Proposed uses SAME base weights as sub-configs plus extra terms
+    """
+    if fd in ("1", "2"):
+        configs = [
+            {
+                "name": "mse_only",
+                "display_name": "MSE Only",
+                "alpha": 0.0, "gamma": 0.0, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_asym",
+                "display_name": "MSE+Asym",
+                "alpha": 0.0, "gamma": 0.0, "asym_weight": 0.05, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_mono",
+                "display_name": "MSE+Mono",
+                "alpha": 0.001, "gamma": 0.0, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_mono_slope",
+                "display_name": "MSE+Mono+Slope",
+                "alpha": 0.001, "gamma": 0.0003, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "full_proposed",
+                "display_name": "Full Proposed",
+                "alpha": 0.001, "gamma": 0.0003, "asym_weight": 0.05, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+        ]
     else:
-        # For FD001/002 the full model is asym+mono+slope
-        configs.append({
-            "name": "full_proposed",
-            "display_name": "Full Proposed",
-            "alpha": 0.001, "gamma": 0.001, "asym_weight": 0.2, "score_weight": 0.0, "smooth_weight": 0.0,
-        })
+        # FD003/004: deeper model, extra score-proxy config
+        configs = [
+            {
+                "name": "mse_only",
+                "display_name": "MSE Only",
+                "alpha": 0.0, "gamma": 0.0, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_asym",
+                "display_name": "MSE+Asym",
+                "alpha": 0.0, "gamma": 0.0, "asym_weight": 0.08, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_mono",
+                "display_name": "MSE+Mono",
+                "alpha": 0.002, "gamma": 0.0, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_mono_slope",
+                "display_name": "MSE+Mono+Slope",
+                "alpha": 0.002, "gamma": 0.0005, "asym_weight": 0.0, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "mse_asym_mono_slope",
+                "display_name": "MSE+Asym+Mono+Slope",
+                "alpha": 0.002, "gamma": 0.0005, "asym_weight": 0.08, "score_weight": 0.0, "smooth_weight": 0.0,
+            },
+            {
+                "name": "full_proposed",
+                "display_name": "Full Proposed",
+                "alpha": 0.002, "gamma": 0.0005, "asym_weight": 0.08, "score_weight": 0.02, "smooth_weight": 0.0,
+            },
+        ]
 
     return configs
 
@@ -774,11 +915,22 @@ def run_ablation_for_fd(fd: str, args) -> List[Dict]:
     if not args._user_set_smoothing:
         effective_args.smoothing_alpha = defaults["smoothing_alpha"]
 
+    # FD-specific epochs (200 for FD003/004, 150 for FD001/002)
+    if not args._user_set_epochs:
+        effective_args.epochs = defaults["epochs"]
+
+    # FD-specific training flags
+    effective_args._shuffle = defaults.get("shuffle", False)
+    effective_args._use_callbacks = defaults.get("use_callbacks", True)
+    use_deep = defaults.get("use_deep_model", False)
+
     print(f"\n{'='*60}")
     print(f"  ABLATION STUDY – FD00{fd}")
     print(f"  Epochs={effective_args.epochs}  Batch={effective_args.batch_size}  "
           f"LR={effective_args.lr}  Dropout={effective_args.dropout}  "
           f"Smooth={effective_args.smoothing_alpha}")
+    print(f"  Shuffle={effective_args._shuffle}  Callbacks={effective_args._use_callbacks}  "
+          f"DeepModel={use_deep}")
     print(f"{'='*60}\n")
 
     X_train, Y_train, X_test, Y_test = load_data(
@@ -802,7 +954,14 @@ def run_ablation_for_fd(fd: str, args) -> List[Dict]:
             score_weight=cfg["score_weight"],
             smooth_weight=cfg["smooth_weight"],
         )
-        res = run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg, effective_args)
+
+        # Use the deep 4-block model for FD003/004 (matching PhysicsFD0034.py)
+        builder = None
+        if use_deep:
+            builder = lambda shape: build_fcn_deep(shape, dropout_rate=effective_args.dropout)
+
+        res = run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg, effective_args,
+                         model_builder=builder)
         results.append(res)
 
     # =====================
@@ -887,10 +1046,11 @@ def run_ablation_for_fd(fd: str, args) -> List[Dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="Ablation study for PI-DP-FCN RUL prediction")
-    parser.add_argument("--fd", default="1",
+    parser.add_argument("--fd", default="all",
                         help="FD sub-dataset: 1, 2, 3, 4, or 'all' to run all four")
     parser.add_argument("--num_test", type=int, default=100, choices=[100, 10000])
-    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Training epochs (default: 150 for FD001/002, 200 for FD003/004)")
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Batch size (default: auto per FD)")
     parser.add_argument("--lr", type=float, default=None,
@@ -918,6 +1078,7 @@ def main():
     args._user_set_lr = args.lr is not None
     args._user_set_dropout = args.dropout is not None
     args._user_set_smoothing = args.smoothing_alpha is not None
+    args._user_set_epochs = args.epochs is not None
 
     # Fill in defaults so downstream code always has values
     if args.batch_size is None:
@@ -928,6 +1089,8 @@ def main():
         args.dropout = 0.5
     if args.smoothing_alpha is None:
         args.smoothing_alpha = 0.3
+    if args.epochs is None:
+        args.epochs = 150
 
     # Setup output directories
     args.out_ablation = os.path.join(args.out_root, "ablation")
