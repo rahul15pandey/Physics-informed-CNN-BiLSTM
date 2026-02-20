@@ -339,21 +339,20 @@ for FD in ['1', '2']:  # FD001 and FD002 only
             print(f"--- Run {i+1}/{run_times} ---")
             model = DualPooling_Model()
             
-            # Cosine-decay LR schedule + gradient clipping for stable convergence
-            steps_per_epoch = max(1, len(X_train) // batch_size)
-            cosine_lr = keras.optimizers.schedules.CosineDecay(
-                initial_learning_rate=fd_lr,
-                decay_steps=nb_epochs * steps_per_epoch,
-                alpha=1e-5,
-            )
-            optimizer = keras.optimizers.Adam(learning_rate=cosine_lr, clipnorm=1.0)
+            # Use float LR + cosine-annealing callback (avoids CosineDecay
+            # schedule object that causes TypeError on save/restore).
+            optimizer = keras.optimizers.Adam(learning_rate=float(fd_lr), clipnorm=1.0)
             
             model.compile(loss=fd_loss, optimizer=optimizer, 
                           metrics=[keras.metrics.RootMeanSquaredError(name="root_mean_squared_error")])
 
-            reduce_lr = keras.callbacks.ReduceLROnPlateau(
-                monitor="loss", factor=0.5, patience=patience_reduce_lr, min_lr=0.0001
-            )
+            # Cosine annealing callback
+            _total_ep = int(nb_epochs)
+            _init_lr = float(fd_lr)
+            _min_lr = 1e-5
+            def _cos_lr(epoch, lr):
+                return _min_lr + 0.5 * (_init_lr - _min_lr) * (1 + math.cos(math.pi * epoch / _total_ep))
+
             model_name = "{}_dataset_{}_run{}".format(method_name, dataset, i)
             model_path_full = os.path.join(model_dir, f"{model_name}.h5")
             already_trained = False
@@ -367,6 +366,7 @@ for FD in ['1', '2']:  # FD001 and FD002 only
                 already_trained = True
             else:
                 earlystopping = keras.callbacks.EarlyStopping(monitor="loss", patience=patience, verbose=1)
+                cosine_lr_cb = keras.callbacks.LearningRateScheduler(_cos_lr, verbose=0)
                 modelcheckpoint = keras.callbacks.ModelCheckpoint(
                     monitor="loss",
                     filepath=model_path_full,
@@ -380,7 +380,7 @@ for FD in ['1', '2']:  # FD001 and FD002 only
                     epochs=nb_epochs,
                     verbose=1,
                     validation_data=(X_test, Y_test),
-                    callbacks=[reduce_lr, earlystopping, modelcheckpoint],
+                    callbacks=[cosine_lr_cb, earlystopping, modelcheckpoint],
                     shuffle=False,
                 )
 

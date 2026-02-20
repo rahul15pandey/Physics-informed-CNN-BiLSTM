@@ -393,15 +393,19 @@ def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args,
             k3=args.k3,
             dropout_rate=args.dropout,
         )
-    # Cosine-decay LR + gradient clipping for stable convergence
-    steps_per_epoch = max(1, len(X_train) // args.batch_size)
-    cosine_lr = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=args.lr,
-        decay_steps=args.epochs * steps_per_epoch,
-        alpha=1e-5,
-    )
-    optimizer = keras.optimizers.Adam(learning_rate=cosine_lr, clipnorm=1.0)
+    # Use a float LR with a cosine-annealing callback instead of a
+    # CosineDecay *schedule object*, because Keras raises TypeError when
+    # anything (save/restore/callbacks) tries to set LR on a schedule.
+    optimizer = keras.optimizers.Adam(learning_rate=float(args.lr), clipnorm=1.0)
     model.compile(loss=loss_fn, optimizer=optimizer, metrics=[root_mean_squared_error])
+
+    # Build cosine-annealing callback
+    _total_epochs = int(args.epochs)
+    _init_lr = float(args.lr)
+    _min_lr = 1e-5
+    def _cosine_lr_fn(epoch, lr):
+        return _min_lr + 0.5 * (_init_lr - _min_lr) * (1 + math.cos(math.pi * epoch / _total_epochs))
+    cosine_cb = keras.callbacks.LearningRateScheduler(_cosine_lr_fn, verbose=0)
 
     # --- Check if we can reuse a cached run ---
     cached = (
@@ -457,12 +461,11 @@ def run_config(X_train, Y_train, X_test, Y_test, loss_fn, cfg: Dict, args,
     use_shuffle = getattr(args, '_shuffle', False)
     use_callbacks = getattr(args, '_use_callbacks', True)
 
-    cb = []
+    cb = [cosine_cb]  # cosine annealing always active
     if use_callbacks:
-        cb = [
-            keras.callbacks.ReduceLROnPlateau(monitor="loss", factor=0.5, patience=args.patience_reduce_lr, min_lr=1e-5),
+        cb.append(
             keras.callbacks.EarlyStopping(monitor="loss", patience=args.patience, verbose=1, restore_best_weights=True),
-        ]
+        )
 
     hist = model.fit(
         X_train,

@@ -216,21 +216,23 @@ for FD in ["3", "4"]:
     # ================= MODEL BUILD / LOAD =================
     model = build_model(X_train.shape[1:])
 
-    # Cosine-decay LR schedule + gradient clipping for stable convergence
-    steps_per_epoch = max(1, len(X_train) // batch_size)
-    total_steps = epochs * steps_per_epoch
-    cosine_lr = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=learning_rate,
-        decay_steps=total_steps,
-        alpha=1e-5,
-    )
-    optimizer = keras.optimizers.Adam(learning_rate=cosine_lr, clipnorm=1.0)
+    # Use float LR + cosine-annealing callback (avoids CosineDecay
+    # schedule object that causes TypeError on save/restore).
+    optimizer = keras.optimizers.Adam(learning_rate=float(learning_rate), clipnorm=1.0)
 
     model.compile(
         loss=physics_loss,
         optimizer=optimizer,
         metrics=[keras.metrics.RootMeanSquaredError(name="RMSE")]
     )
+
+    # Cosine-annealing callback
+    _total_ep = int(epochs)
+    _init_lr = float(learning_rate)
+    _min_lr = 1e-5
+    def _cos_lr(epoch, lr):
+        return _min_lr + 0.5 * (_init_lr - _min_lr) * (1 + math.cos(math.pi * epoch / _total_ep))
+    cosine_lr_cb = keras.callbacks.LearningRateScheduler(_cos_lr, verbose=0)
 
     # Paths for saving model and weights
     model_path = os.path.join(MODEL_DIR, f"FD00{FD}_model.h5")
@@ -249,6 +251,7 @@ for FD in ["3", "4"]:
             epochs=epochs,
             batch_size=batch_size,
             validation_data=(X_test, Y_test),
+            callbacks=[cosine_lr_cb],
             shuffle=True,
             verbose=1
         )
