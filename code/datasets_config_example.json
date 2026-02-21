@@ -1,0 +1,66 @@
+[
+    {
+        "type": "synthetic",
+        "name": "Synthetic_Degradation",
+        "sequence_length": 30,
+        "rul_cap": 125,
+        "n_units_train": 80,
+        "n_units_test": 20,
+        "max_life": 200,
+        "n_features": 14,
+        "noise_std": 0.3
+    },
+    {
+        "type": "csv",
+        "name": "Custom_Turbine_RUL",
+        "sequence_length": 30,
+        "rul_cap": 125,
+        "train_path": "path/to/train.csv",
+        "test_path": "path/to/test.csv",
+        "unit_col": "unit_id",
+        "cycle_col": "cycle",
+        "target_col": "RUL",
+        "delimiter": ","
+    },
+    {
+        "type": "nasa_bearing",
+        "name": "NASA_IMS_Bearing",
+        "sequence_length": 50,
+        "rul_cap": null,
+        "data_dir": "path/to/IMS_bearing_data",
+        "test_ratio": 0.2
+    },
+    {
+        "type": "battery",
+        "name": "Battery_Capacity_Fade",
+        "sequence_length": 20,
+        "rul_cap": null,
+        "csv_path": "path/to/battery_data.csv",
+        "cycle_col": "cycle",
+        "capacity_col": "capacity",
+        "cell_col": "cell_id",
+        "eol_threshold": 0.7,
+        "train_ratio": 0.8
+    },
+    {
+        "type": "phm2012",
+        "name": "PHM2012_PRONOSTIA",
+        "sequence_length": 40,
+        "rul_cap": null,
+        "data_dir": "path/to/PHM2012_data",
+        "condition": "1",
+        "train_bearings": ["1", "2"],
+        "test_bearings": ["3"]
+    },
+    {
+        "type": "numpy",
+        "name": "Custom_NumPy",
+        "sequence_length": 30,
+        "rul_cap": 125,
+        "train_X_path": "path/to/X_train.npy",
+        "train_Y_path": "path/to/Y_train.npy",
+        "test_X_path": "path/to/X_test.npy",
+        "test_Y_path": "path/to/Y_test.npy",
+        "already_windowed": false
+    }
+]
